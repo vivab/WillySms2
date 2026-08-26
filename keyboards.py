@@ -3,10 +3,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 def main_menu(admin=False, superadmin=False):
     rows = [
-        [InlineKeyboardButton("📋 Сервисы", callback_data="services")],
+        [InlineKeyboardButton("Сдать номер", callback_data="services")],
         [InlineKeyboardButton("📍 Мои номера", callback_data="mynumbers")],
         [InlineKeyboardButton("📊 Моя статистика", callback_data="mystats")],
-        [InlineKeyboardButton("📥 Мои заявки", callback_data="myrequests")],
     ]
     if admin or superadmin:
         rows.append([InlineKeyboardButton("🛠 Админка", callback_data="admin")])
@@ -16,7 +15,7 @@ def main_menu(admin=False, superadmin=False):
 
 
 def services_pick_keyboard(services):
-    rows = [[InlineKeyboardButton(f"🟢 {s['name']} — ${s['price']:.2f}", callback_data=f"svc:{s['id']}")] for s in services]
+    rows = [[InlineKeyboardButton(f"🟢 {s['name']}", callback_data=f"svc:{s['id']}")] for s in services]
     rows.append([InlineKeyboardButton("🔙 Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
@@ -27,6 +26,13 @@ def back_main_keyboard():
 
 def home_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В главное меню", callback_data="back_main")]])
+
+
+def after_add_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Добавить ещё✅", callback_data="services")],
+        [InlineKeyboardButton("Главное меню", callback_data="back_main")],
+    ])
 
 
 def admin_menu():
@@ -95,6 +101,10 @@ def admin_hold_keyboard(request_id, paused=False):
     ])
 
 
+def late_slot_keyboard(request_id):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Слёт📛", callback_data=f"slot:{request_id}")]])
+
+
 def review_keyboard(request_id):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve:{request_id}"),
@@ -105,6 +115,7 @@ def review_keyboard(request_id):
 def owner_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Общая статистика", callback_data="owner_stats")],
+        [InlineKeyboardButton("⏱ Статистика номеров", callback_data="owner_durations")],
         [InlineKeyboardButton("➕ Добавить сервис", callback_data="owner_services")],
         [InlineKeyboardButton("💸 Выплаты", callback_data="owner_payouts")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_main")],
