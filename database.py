@@ -2,6 +2,8 @@ import sqlite3
 from datetime import datetime, timedelta
 from config import DB_NAME
 
+HOLD_DUR_EXPR = "CAST((julianday(CURRENT_TIMESTAMP) - julianday(hold_started_at)) * 1440 AS INTEGER)"
+
 
 def connect():
     conn = sqlite3.connect(DB_NAME)
@@ -40,6 +42,7 @@ def init_db():
             price REAL NOT NULL,
             hold_seconds INTEGER NOT NULL DEFAULT 0,
             mode TEXT NOT NULL DEFAULT 'user_gives_code',
+            recurring INTEGER NOT NULL DEFAULT 0,
             is_active INTEGER DEFAULT 1,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -61,10 +64,13 @@ def init_db():
             status TEXT DEFAULT 'queued',
             paused INTEGER DEFAULT 0,
             remaining_seconds INTEGER,
+            banned INTEGER DEFAULT 0,
+            held_minutes INTEGER,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             taken_at TEXT,
             code_sent_at TEXT,
             confirmed_at TEXT,
+            hold_started_at TEXT,
             hold_until TEXT,
             completed_at TEXT
         );
@@ -155,23 +161,13 @@ def get_activity_pending(user_id):
     return bool(row["pending"]) if row else False
 
 
-def user_queued_requests(user_id):
-    with connect() as c:
-        return c.execute("""
-            SELECT r.*, s.name AS service_name
-            FROM requests r JOIN services s ON s.id = r.service_id
-            WHERE r.user_id=? AND r.status='queued'
-            ORDER BY r.id
-        """, (user_id,)).fetchall()
-
-
 # ---------- Сервисы ----------
 
-def add_service(name, price, hold_seconds, mode):
+def add_service(name, price, hold_seconds, mode, recurring=0):
     with connect() as c:
         cur = c.execute(
-            "INSERT INTO services(name, price, hold_seconds, mode) VALUES (?,?,?,?)",
-            (name, price, hold_seconds, mode)
+            "INSERT INTO services(name, price, hold_seconds, mode, recurring) VALUES (?,?,?,?,?)",
+            (name, price, hold_seconds, mode, recurring)
         )
         return cur.lastrowid
 
@@ -237,7 +233,7 @@ def get_request(request_id):
     with connect() as c:
         return c.execute("""
             SELECT r.*, s.name AS service_name, s.price AS service_price,
-                   s.mode AS service_mode, s.hold_seconds AS service_hold
+                   s.mode AS service_mode, s.hold_seconds AS service_hold, s.recurring AS service_recurring
             FROM requests r JOIN services s ON s.id = r.service_id
             WHERE r.id = ?
         """, (request_id,)).fetchone()
@@ -247,9 +243,9 @@ def user_active_requests(user_id):
     with connect() as c:
         return c.execute("""
             SELECT r.*, s.name AS service_name, s.price AS service_price,
-                   s.mode AS service_mode, s.hold_seconds AS service_hold
+                   s.mode AS service_mode, s.hold_seconds AS service_hold, s.recurring AS service_recurring
             FROM requests r JOIN services s ON s.id = r.service_id
-            WHERE r.user_id = ? AND r.status NOT IN ('paid','rejected','banned_no_pay')
+            WHERE r.user_id = ? AND r.status NOT IN ('paid','rejected','banned_no_pay','stopped')
             ORDER BY r.id DESC
         """, (user_id,)).fetchall()
 
@@ -258,7 +254,7 @@ def queued_for_service(service_id):
     with connect() as c:
         return c.execute("""
             SELECT r.*, s.name AS service_name, s.price AS service_price,
-                   s.mode AS service_mode, s.hold_seconds AS service_hold
+                   s.mode AS service_mode, s.hold_seconds AS service_hold, s.recurring AS service_recurring
             FROM requests r JOIN services s ON s.id = r.service_id
             WHERE r.service_id = ? AND r.status = 'queued'
             ORDER BY r.id
@@ -314,18 +310,21 @@ def admin_approve_hold(request_id, admin_id):
     hold_until = (datetime.utcnow() + timedelta(seconds=r["service_hold"])).strftime("%Y-%m-%d %H:%M:%S")
     with connect() as c:
         c.execute("""
-            UPDATE requests SET status='in_hold', hold_until=?
+            UPDATE requests SET status='in_hold', hold_until=?, hold_started_at=CURRENT_TIMESTAMP
             WHERE id=? AND status='user_confirmed'
         """, (hold_until, request_id))
     log_action(admin_id, "approve_hold", request_id)
-    return {"hold_until": hold_until, "hold_seconds": r["service_hold"], "phone": r["phone"], "user_id": r["user_id"]}
+    return {
+        "hold_until": hold_until, "hold_seconds": r["service_hold"], "phone": r["phone"],
+        "user_id": r["user_id"], "recurring": bool(r["service_recurring"])
+    }
 
 
 def pause_hold(request_id, admin_id):
     r = get_request(request_id)
     if not r or r["status"] != "in_hold" or r["paused"]:
         return None
-    remaining = seconds_remaining(r["hold_until"])
+    remaining = seconds_remaining(r["hold_until"]) if not r["service_recurring"] else 3600
     with connect() as c:
         c.execute("UPDATE requests SET paused=1, remaining_seconds=? WHERE id=?", (remaining, request_id))
     log_action(admin_id, "pause_hold", request_id)
@@ -345,14 +344,16 @@ def resume_hold(request_id, admin_id):
 
 
 def finalize_payment(request_id):
+    """Начисляет оплату по завершении фиксированного холда. Идемпотентно — платит только один раз."""
     with connect() as c:
         row = c.execute("SELECT * FROM requests WHERE id=? AND status='in_hold'", (request_id,)).fetchone()
         if not row:
             return None
-        cur = c.execute(
-            "UPDATE requests SET status='paid', completed_at=CURRENT_TIMESTAMP WHERE id=? AND status='in_hold'",
-            (request_id,)
-        )
+        cur = c.execute(f"""
+            UPDATE requests SET status='paid', completed_at=CURRENT_TIMESTAMP,
+                held_minutes={HOLD_DUR_EXPR}
+            WHERE id=? AND status='in_hold'
+        """, (request_id,))
         if cur.rowcount != 1:
             return None
         price = c.execute("SELECT price FROM services WHERE id=?", (row["service_id"],)).fetchone()["price"]
@@ -362,24 +363,66 @@ def finalize_payment(request_id):
                 balance = balance + excluded.balance,
                 total_earned = total_earned + excluded.total_earned
         """, (row["user_id"], price, price))
-        result = {"user_id": row["user_id"], "phone": row["phone"], "price": price}
+        result = {"user_id": row["user_id"], "phone": row["phone"], "price": price, "admin_id": row["admin_id"]}
     log_action(0, "auto_pay", request_id, f"price={price}")
     return result
 
 
 def mark_banned(request_id, admin_id):
-    """Слёт до завершения холда — без оплаты. Если холд уже завершён — возвращает None (поздно)."""
+    """Слёт ДО завершения холда (фикс. режим) — без оплаты."""
     with connect() as c:
-        cur = c.execute(
-            "UPDATE requests SET status='banned_no_pay', completed_at=CURRENT_TIMESTAMP WHERE id=? AND status='in_hold'",
-            (request_id,)
-        )
+        cur = c.execute(f"""
+            UPDATE requests SET status='banned_no_pay', completed_at=CURRENT_TIMESTAMP,
+                held_minutes={HOLD_DUR_EXPR}, banned=1
+            WHERE id=? AND status='in_hold'
+        """, (request_id,))
         ok = cur.rowcount == 1
     if not ok:
         return None
     row = get_request(request_id)
     log_action(admin_id, "mark_banned", request_id)
     return {"phone": row["phone"], "user_id": row["user_id"]}
+
+
+def mark_late_banned(request_id, admin_id):
+    """Слёт ПОСЛЕ того как холд уже завершился и оплата произведена — просто метка для статистики,
+    баланс не трогаем, пользователю не сообщаем."""
+    with connect() as c:
+        cur = c.execute("UPDATE requests SET banned=1 WHERE id=? AND status='paid' AND banned=0", (request_id,))
+        ok = cur.rowcount == 1
+    if ok:
+        log_action(admin_id, "late_slot", request_id)
+    return ok
+
+
+def stop_recurring(request_id, admin_id):
+    """Останавливает дальнейшие почасовые начисления. Уже выплаченные часы не отменяются."""
+    with connect() as c:
+        cur = c.execute(f"""
+            UPDATE requests SET status='stopped', completed_at=CURRENT_TIMESTAMP,
+                held_minutes={HOLD_DUR_EXPR}, banned=1
+            WHERE id=? AND status='in_hold'
+        """, (request_id,))
+        ok = cur.rowcount == 1
+    if ok:
+        log_action(admin_id, "stop_recurring", request_id)
+    return ok
+
+
+def credit_recurring_payment(request_id, price):
+    """Начисляет очередную почасовую выплату, статус заявки не меняется (холд продолжается)."""
+    r = get_request(request_id)
+    if not r:
+        return None
+    with connect() as c:
+        c.execute("""
+            INSERT INTO balances(user_id, balance, total_earned) VALUES (?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                balance = balance + excluded.balance,
+                total_earned = total_earned + excluded.total_earned
+        """, (r["user_id"], price, price))
+    log_action(0, "recurring_pay", request_id, f"price={price}")
+    return {"user_id": r["user_id"], "phone": r["phone"]}
 
 
 def cancel_request(request_id, actor_id, by_user=False):
@@ -396,7 +439,11 @@ def cancel_request(request_id, actor_id, by_user=False):
 
 def in_hold_requests():
     with connect() as c:
-        return c.execute("SELECT * FROM requests WHERE status='in_hold' AND paused=0").fetchall()
+        return c.execute("""
+            SELECT r.*, s.recurring AS service_recurring, s.hold_seconds AS service_hold, s.price AS service_price
+            FROM requests r JOIN services s ON s.id = r.service_id
+            WHERE r.status='in_hold' AND r.paused=0
+        """).fetchall()
 
 
 def clear_queue(service_id=None):
@@ -505,6 +552,18 @@ def debit_amount(user_id, amount):
         return cur.rowcount == 1
 
 
+# ---------- Статистика по времени холда ----------
+
+def held_stats(limit=20):
+    with connect() as c:
+        return c.execute("""
+            SELECT r.phone, r.held_minutes, s.name AS service_name, r.status
+            FROM requests r JOIN services s ON s.id = r.service_id
+            WHERE r.held_minutes IS NOT NULL
+            ORDER BY r.id DESC LIMIT ?
+        """, (limit,)).fetchall()
+
+
 # ---------- Общая статистика ----------
 
 def get_stats():
@@ -519,6 +578,7 @@ def get_stats():
         paid = cnt("paid")
         rejected = cnt("rejected")
         banned_no_pay = cnt("banned_no_pay")
+        stopped = cnt("stopped")
         total_earned = c.execute("SELECT COALESCE(SUM(total_earned), 0) FROM balances").fetchone()[0]
         total_balance = c.execute("SELECT COALESCE(SUM(balance), 0) FROM balances").fetchone()[0]
         users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -528,6 +588,6 @@ def get_stats():
         return {
             "total_requests": total_requests, "queued": queued, "in_progress": in_progress,
             "in_hold": in_hold, "paid": paid, "rejected": rejected, "banned_no_pay": banned_no_pay,
-            "total_earned": total_earned, "total_balance": total_balance,
+            "stopped": stopped, "total_earned": total_earned, "total_balance": total_balance,
             "users": users, "services": services, "admins": admins,
         }
