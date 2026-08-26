@@ -15,13 +15,19 @@ def parse_price(value: str) -> float:
     return float(value.replace("$", "").replace(",", ".").strip())
 
 
+def fmt_price(p: float) -> str:
+    """Красиво форматирует цену: 4.0 -> '4', 4.50 -> '4.5', 3.25 -> '3.25'."""
+    s = f"{p:.2f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
 def parse_hold_time(value: str) -> int:
     """Парсит '10м', '1ч', '45с', '1ч30м' и т.п. в секунды."""
     value = value.lower().strip()
-    total = 0
     matches = re.findall(r"(\d+)\s*(ч|м|с)", value)
     if not matches:
         return int(value) if value.isdigit() else 0
+    total = 0
     for num, unit in matches:
         num = int(num)
         if unit == "ч":
