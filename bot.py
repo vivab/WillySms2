@@ -3,32 +3,34 @@ from telegram.ext import (
     MessageHandler, ConversationHandler, filters
 )
 from config import BOT_TOKEN
-from database import init_db, in_hold_requests, seconds_remaining, finalize_payment, get_users_with_queued
+from database import init_db, in_hold_requests, seconds_remaining, get_users_with_queued
 from handlers import *
 
 
 async def reschedule_holds(app):
-    """При старте бота подхватывает все активные (не на паузе) холды после перезапуска,
-    а также заново запускает таймеры проверки активности для пользователей с номерами в очереди."""
+    """При старте бота подхватывает все активные холды (фиксированные и почасовые) после
+    перезапуска, а также заново запускает таймеры проверки активности для пользователей
+    с номерами в очереди."""
     for r in in_hold_requests():
+        if r["service_recurring"]:
+            app.job_queue.run_repeating(
+                hourly_pay_job, interval=3600, first=3600,
+                data={"request_id": r["id"]}, name=f"hold_{r['id']}"
+            )
+            continue
         remaining = seconds_remaining(r["hold_until"])
-        if remaining <= 0:
-            result = finalize_payment(r["id"])
-            if result:
-                try:
-                    await app.bot.send_message(
-                        result["user_id"],
-                        f"💚✅ Отличная работа! Холд по номеру «{result['phone']}» завершён — начислено ${result['price']:.2f}."
-                    )
-                except Exception:
-                    pass
-        else:
-            app.job_queue.run_once(hold_finished_job, when=remaining, data={"request_id": r["id"]}, name=f"hold_{r['id']}")
+        app.job_queue.run_once(
+            hold_finished_job, when=max(remaining, 0),
+            data={"request_id": r["id"]}, name=f"hold_{r['id']}"
+        )
 
     for uid in get_users_with_queued():
         job_name = f"activity_{uid}"
         if not app.job_queue.get_jobs_by_name(job_name):
-            app.job_queue.run_repeating(activity_check_job, interval=720, first=720, data={"user_id": uid}, name=job_name)
+            app.job_queue.run_repeating(
+                activity_check_job, interval=720, first=720,
+                data={"user_id": uid}, name=job_name
+            )
 
 
 def main():
@@ -69,7 +71,6 @@ def main():
     app.add_handler(CallbackQueryHandler(services, pattern=r"^services$"))
     app.add_handler(CallbackQueryHandler(my_numbers, pattern=r"^mynumbers$"))
     app.add_handler(CallbackQueryHandler(my_stats, pattern=r"^mystats$"))
-    app.add_handler(CallbackQueryHandler(my_requests, pattern=r"^myrequests$"))
     app.add_handler(CallbackQueryHandler(user_im_here, pattern=r"^imhere:\d+$"))
 
     app.add_handler(CallbackQueryHandler(admin_panel, pattern=r"^admin$"))
@@ -90,6 +91,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(owner_panel, pattern=r"^owner$"))
     app.add_handler(CallbackQueryHandler(owner_stats, pattern=r"^owner_stats$"))
+    app.add_handler(CallbackQueryHandler(owner_durations, pattern=r"^owner_durations$"))
     app.add_handler(CallbackQueryHandler(owner_services, pattern=r"^owner_services$"))
     app.add_handler(CallbackQueryHandler(owner_payouts, pattern=r"^owner_payouts$"))
     app.add_handler(CallbackQueryHandler(owner_payall, pattern=r"^owner_payall$"))
@@ -97,7 +99,7 @@ def main():
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, admin_send_code))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
 
-    print("Willy SMS 24/7 (v3) bot started")
+    print("Willy bot started")
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 
