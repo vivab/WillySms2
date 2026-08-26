@@ -4,7 +4,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 from database import *
 from keyboards import *
-from utils import has_admin_access, is_superadmin, parse_price, parse_hold_time, normalize_phone
+from utils import has_admin_access, is_superadmin, parse_price, parse_hold_time, fmt_price, normalize_phone
 from config import SUPERADMIN_IDS
 from crypto_pay import transfer_crypto, create_invoice, CryptoPayError
 
@@ -18,7 +18,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user(uid)
     context.user_data.clear()
     await update.message.reply_text(
-        "🟢👋 Добро пожаловать в Willy SMS 24/7!\n\nВыберите действие:",
+        "🟢👋 Добро пожаловать в Willy!\n\nВыберите действие:",
         reply_markup=main_menu(has_admin_access(uid), is_superadmin(uid))
     )
 
@@ -29,7 +29,7 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     context.user_data.clear()
     await q.message.edit_text(
-        "🟢👋 Добро пожаловать в Willy SMS 24/7!\n\nВыберите действие:",
+        "🟢👋 Добро пожаловать в Willy!\n\nВыберите действие:",
         reply_markup=main_menu(has_admin_access(uid), is_superadmin(uid))
     )
 
@@ -56,7 +56,7 @@ async def pick_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["chosen_service"] = sid
     await q.message.edit_text(
-        f"📱 Сервис: <b>{service['name']}</b> (${service['price']:.2f})\n\n"
+        f"📱 Сервис: <b>{service['name']}</b>\n\n"
         f"Отправьте от 1 до 10 номеров телефона — каждый с новой строки:\n\n"
         f"+79867345674\n+79001112233\n\n"
         f"Каждый номер станет отдельной заявкой в очереди.",
@@ -85,16 +85,30 @@ async def receive_phones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ids = create_requests(update.effective_user.id, sid, phones)
     for rid in ids:
-        log_action(update.effective_user.id, "create_request", rid, phone_for=service["name"])
+        log_action(update.effective_user.id, "create_request", rid, details=service["name"])
 
-    lines = []
-    for rid in ids:
-        pos = queue_position(rid)
-        r = get_request(rid)
-        lines.append(f"📱 <code>{r['phone']}</code> — место в очереди: {pos}")
+    if len(ids) == 1:
+        pos = queue_position(ids[0])
+        r = get_request(ids[0])
+        text = (
+            f"Отлично! Номер «<code>{r['phone']}</code>» добавлен в очередь, ожидайте администратора!\n\n"
+            f"📍 Место в очереди: <b>{pos}</b>\n\n"
+            f"Хотите добавить ещё?"
+        )
+    else:
+        lines = []
+        for rid in ids:
+            pos = queue_position(rid)
+            r = get_request(rid)
+            lines.append(f"📱 <code>{r['phone']}</code> — место в очереди: <b>{pos}</b>")
+        text = (
+            "Отлично! Номера добавлены в очередь, ожидайте администратора!\n\n" +
+            "\n".join(lines) +
+            "\n\nХотите добавить ещё?"
+        )
+
     if invalid:
-        lines.append("")
-        lines.append("⚠️ Пропущены нераспознанные: " + ", ".join(invalid))
+        text += "\n\n⚠️ Пропущены нераспознанные: " + ", ".join(invalid)
 
     context.user_data.clear()
 
@@ -105,12 +119,7 @@ async def receive_phones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data={"user_id": update.effective_user.id}, name=job_name
         )
 
-    await update.message.reply_text(
-        f"🟢✅ <b>Заявки добавлены!</b>\n\n" + "\n".join(lines) +
-        f"\n\n⏳ Ожидайте, пока администратор возьмёт номера в работу.",
-        reply_markup=main_menu(has_admin_access(update.effective_user.id), is_superadmin(update.effective_user.id)),
-        parse_mode="HTML"
-    )
+    await update.message.reply_text(text, reply_markup=after_add_keyboard(), parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -122,7 +131,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ==================== Личная статистика / заявки ====================
+# ==================== Личная статистика / номера ====================
 
 async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -142,12 +151,12 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def my_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def my_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     rows = user_active_requests(q.from_user.id)
     if not rows:
-        await q.message.edit_text("📭 Активных заявок нет.", reply_markup=back_main_keyboard())
+        await q.message.edit_text("📭 У вас нет активных номеров.", reply_markup=back_main_keyboard())
         return
 
     status_map = {
@@ -157,15 +166,71 @@ async def my_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "in_hold": "⏳ Холд, ожидание оплаты",
         "pending_review": "🔎 Код на проверке",
     }
-    text = "📊 <b>Ваши активные заявки:</b>\n\n"
+    lines = []
     for r in rows:
         if r["status"] == "queued":
             pos = queue_position(r["id"])
-            status_text = f"⏳ Место в очереди: {pos}"
+            status_text = f"⏳ Место в очереди: <b>{pos}</b>"
         else:
             status_text = status_map.get(r["status"], r["status"])
-        text += f"📱 <code>{r['phone']}</code> — {r['service_name']}\nСтатус: {status_text}\n————\n"
-    await q.message.edit_text(text, reply_markup=back_main_keyboard(), parse_mode="HTML")
+        lines.append(f"📱 <code>{r['phone']}</code> — {r['service_name']}\n{status_text}\n————")
+    await q.message.edit_text(
+        "📍 <b>Ваши номера:</b>\n\n" + "\n".join(lines),
+        reply_markup=back_main_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+# ---------- Проверка активности ----------
+
+async def activity_check_job(context: ContextTypes.DEFAULT_TYPE):
+    uid = context.job.data["user_id"]
+    if not user_has_queued(uid):
+        context.job.schedule_removal()
+        return
+    set_activity_pending(uid, True)
+    try:
+        await context.bot.send_message(
+            uid,
+            "👀 <b>Вы тут?</b>\n\nУ вас есть номера в очереди — подтвердите, что вы на месте!\n"
+            "Если не нажмёте кнопку в течение 3 минут, номера будут убраны из очереди.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Я готов✅", callback_data=f"imhere:{uid}")]]),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    context.job_queue.run_once(activity_deadline_job, when=180, data={"user_id": uid}, name=f"activity_deadline_{uid}")
+
+
+async def activity_deadline_job(context: ContextTypes.DEFAULT_TYPE):
+    uid = context.job.data["user_id"]
+    if not get_activity_pending(uid):
+        return
+    count = cancel_all_queued_for_user(uid)
+    set_activity_pending(uid, False)
+    if count:
+        try:
+            await context.bot.send_message(
+                uid,
+                "⏰ Вы не подтвердили активность вовремя — ваши номера убраны из очереди.\n"
+                "Можете добавить их заново, когда будете готовы 🟢"
+            )
+        except Exception:
+            pass
+
+
+async def user_im_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = int(q.data.split(":")[1])
+    if q.from_user.id != uid:
+        await q.answer("Недоступно.", show_alert=True)
+        return
+    set_activity_pending(uid, False)
+    await q.answer("👍 Отлично, продолжаем!")
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 # ==================== Админка: взятие номера ====================
@@ -210,7 +275,6 @@ async def adm_show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"🟢 <b>{r['service_name']}</b> ({mode_label})\n\n"
         f"Номер: <code>{r['phone']}</code>\n"
-        f"Цена: <b>${r['service_price']:.2f}</b>\n"
         f"В очереди ещё: {len(rows) - 1}"
     )
     await q.message.edit_text(text, reply_markup=take_keyboard(r["id"]), parse_mode="HTML")
@@ -438,17 +502,27 @@ async def admin_confirm_or_decline(update: Update, context: ContextTypes.DEFAULT
             await q.answer("❌ Заявка уже обработана.", show_alert=True)
             return
         await q.answer("✅ В холде!")
-        hold_text = fmt_hold(result["hold_seconds"])
+
+        if result["recurring"]:
+            hold_text = "каждый час"
+        else:
+            hold_text = fmt_hold(result["hold_seconds"])
+
         await q.message.edit_text(
-            f"✅ Вы взяли номер «{result['phone']}» в холд на {hold_text}.\n\n"
+            f"✅ Вы взяли номер «{result['phone']}» в холд ({hold_text}).\n\n"
             f"📛 Если аккаунт получил ограничение, блок или слетел — жмите «Слёт» и берите следующий номер.\n"
             f"⛔️/✅ Если у вас перерыв или конец смены — жмите «Стоп», а когда вернётесь — «Начать», холд продолжится с того же места.",
             reply_markup=admin_hold_keyboard(rid, paused=False)
         )
+
         job_name = f"hold_{rid}"
         for j in context.job_queue.get_jobs_by_name(job_name):
             j.schedule_removal()
-        context.job_queue.run_once(hold_finished_job, when=result["hold_seconds"], data={"request_id": rid}, name=job_name)
+        if result["recurring"]:
+            context.job_queue.run_repeating(hourly_pay_job, interval=3600, first=3600, data={"request_id": rid}, name=job_name)
+        else:
+            context.job_queue.run_once(hold_finished_job, when=result["hold_seconds"], data={"request_id": rid}, name=job_name)
+
         try:
             await context.bot.send_message(
                 result["user_id"],
@@ -484,6 +558,9 @@ async def admin_pause_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer("Нет доступа", show_alert=True)
         return
 
+    r = get_request(rid)
+    recurring = bool(r["service_recurring"]) if r else False
+
     if action == "pause":
         remaining = pause_hold(rid, q.from_user.id)
         if remaining is None:
@@ -501,7 +578,10 @@ async def admin_pause_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if remaining is None:
             await q.answer("Недоступно.", show_alert=True)
             return
-        context.job_queue.run_once(hold_finished_job, when=remaining, data={"request_id": rid}, name=f"hold_{rid}")
+        if recurring:
+            context.job_queue.run_repeating(hourly_pay_job, interval=3600, first=3600, data={"request_id": rid}, name=f"hold_{rid}")
+        else:
+            context.job_queue.run_once(hold_finished_job, when=remaining, data={"request_id": rid}, name=f"hold_{rid}")
         await q.answer("▶️ Холд возобновлён")
         try:
             await q.message.edit_reply_markup(reply_markup=admin_hold_keyboard(rid, paused=False))
@@ -515,24 +595,71 @@ async def admin_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_admin_access(q.from_user.id):
         await q.answer("Нет доступа", show_alert=True)
         return
-    result = mark_banned(rid, q.from_user.id)
-    if not result:
-        await q.answer("⏰ Холд уже завершён, оплата произведена — отменить нельзя.", show_alert=True)
+    r = get_request(rid)
+    if not r:
+        await q.answer("Заявка не найдена.", show_alert=True)
         return
-    await q.answer("Отмечено")
-    for j in context.job_queue.get_jobs_by_name(f"hold_{rid}"):
-        j.schedule_removal()
-    try:
-        await q.message.edit_text(f"📛 Номер «{result['phone']}» отмечен как слетевший. Оплата не производится.")
-    except Exception:
-        pass
-    try:
-        await context.bot.send_message(
-            result["user_id"],
-            f"😔 Ваш номер «{result['phone']}» слетел до завершения холда.\nК сожалению, оплата в этот раз не производится."
-        )
-    except Exception:
-        pass
+
+    if r["status"] == "in_hold":
+        if r["service_recurring"]:
+            ok = stop_recurring(rid, q.from_user.id)
+            if not ok:
+                await q.answer("Недоступно.", show_alert=True)
+                return
+            for j in context.job_queue.get_jobs_by_name(f"hold_{rid}"):
+                j.schedule_removal()
+            await q.answer("Остановлено")
+            try:
+                await q.message.edit_text(
+                    f"📛 Номер «{r['phone']}» остановлен. Начисления прекращены, всё уже выплаченное остаётся у пользователя."
+                )
+            except Exception:
+                pass
+            try:
+                await context.bot.send_message(
+                    r["user_id"],
+                    f"😔 Номер «{r['phone']}» остановлен администратором.\n"
+                    f"Начисления прекращены, но всё уже выплаченное остаётся на вашем балансе 💚"
+                )
+            except Exception:
+                pass
+        else:
+            result = mark_banned(rid, q.from_user.id)
+            if not result:
+                await q.answer("Недоступно.", show_alert=True)
+                return
+            for j in context.job_queue.get_jobs_by_name(f"hold_{rid}"):
+                j.schedule_removal()
+            await q.answer("Отмечено")
+            try:
+                await q.message.edit_text(f"📛 Номер «{result['phone']}» отмечен как слетевший. Оплата не производится.")
+            except Exception:
+                pass
+            try:
+                await context.bot.send_message(
+                    result["user_id"],
+                    f"😔 Ваш номер «{result['phone']}» слетел до завершения холда.\n"
+                    f"К сожалению, оплата в этот раз не производится."
+                )
+            except Exception:
+                pass
+
+    elif r["status"] == "paid" and not r["service_recurring"]:
+        ok = mark_late_banned(rid, q.from_user.id)
+        if not ok:
+            await q.answer("Уже отмечено ранее.", show_alert=True)
+            return
+        await q.answer("Отмечено для статистики")
+        try:
+            await q.message.edit_text(
+                f"📛 Номер «{r['phone']}» отмечен как слетевший (задним числом).\n"
+                f"Оплата уже была произведена и не отменяется. Пользователь не уведомляется."
+            )
+        except Exception:
+            pass
+
+    else:
+        await q.answer("Недоступно для этой заявки.", show_alert=True)
 
 
 async def hold_finished_job(context: ContextTypes.DEFAULT_TYPE):
@@ -546,6 +673,36 @@ async def hold_finished_job(context: ContextTypes.DEFAULT_TYPE):
             f"💚✅ <b>Отличная работа!</b>\n\n"
             f"Холд по номеру «{result['phone']}» завершён — начислено <b>${result['price']:.2f}</b>.\n"
             f"Спасибо, что вы с нами! 🎉",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    if result.get("admin_id"):
+        try:
+            await context.bot.send_message(
+                result["admin_id"],
+                f"✅ Холд по номеру «{result['phone']}» завершён, оплата ${result['price']:.2f} произведена.\n\n"
+                f"Если позже узнаете, что аккаунт заблокирован или в спаме — всё равно отметьте это "
+                f"(для статистики, оплата не отменяется, пользователь уведомлён не будет):",
+                reply_markup=late_slot_keyboard(rid),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+
+async def hourly_pay_job(context: ContextTypes.DEFAULT_TYPE):
+    rid = context.job.data["request_id"]
+    r = get_request(rid)
+    if not r or r["status"] != "in_hold":
+        context.job.schedule_removal()
+        return
+    price = r["service_price"]
+    credit_recurring_payment(rid, price)
+    try:
+        await context.bot.send_message(
+            r["user_id"],
+            f"💚 Начислено <b>${price:.2f}</b> за очередной час работы номера «{r['phone']}»!",
             parse_mode="HTML"
         )
     except Exception:
@@ -622,76 +779,6 @@ async def review_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-async def my_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    rows = user_queued_requests(q.from_user.id)
-    if not rows:
-        await q.message.edit_text("📭 У вас нет номеров в очереди.", reply_markup=back_main_keyboard())
-        return
-    lines = []
-    for r in rows:
-        pos = queue_position(r["id"])
-        lines.append(f"📱 <code>{r['phone']}</code> — {r['service_name']} — место в очереди: <b>{pos}</b>")
-    await q.message.edit_text(
-        "📍 <b>Ваши номера в очереди:</b>\n\n" + "\n".join(lines),
-        reply_markup=back_main_keyboard(),
-        parse_mode="HTML"
-    )
-
-
-# ---------- Проверка активности ----------
-
-async def activity_check_job(context: ContextTypes.DEFAULT_TYPE):
-    uid = context.job.data["user_id"]
-    if not user_has_queued(uid):
-        context.job.schedule_removal()
-        return
-    set_activity_pending(uid, True)
-    try:
-        await context.bot.send_message(
-            uid,
-            "👀 <b>Вы тут?</b>\n\nУ вас есть номера в очереди — подтвердите, что вы на месте!\n"
-            "Если не нажмёте кнопку в течение 3 минут, номера будут убраны из очереди.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Я готов✅", callback_data=f"imhere:{uid}")]]),
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-    context.job_queue.run_once(activity_deadline_job, when=180, data={"user_id": uid}, name=f"activity_deadline_{uid}")
-
-
-async def activity_deadline_job(context: ContextTypes.DEFAULT_TYPE):
-    uid = context.job.data["user_id"]
-    if not get_activity_pending(uid):
-        return
-    count = cancel_all_queued_for_user(uid)
-    set_activity_pending(uid, False)
-    if count:
-        try:
-            await context.bot.send_message(
-                uid,
-                "⏰ Вы не подтвердили активность вовремя — ваши номера убраны из очереди.\n"
-                "Можете добавить их заново, когда будете готовы 🟢"
-            )
-        except Exception:
-            pass
-
-
-async def user_im_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = int(q.data.split(":")[1])
-    if q.from_user.id != uid:
-        await q.answer("Недоступно.", show_alert=True)
-        return
-    set_activity_pending(uid, False)
-    await q.answer("👍 Отлично, продолжаем!")
-    try:
-        await q.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-
 # ==================== Владелец ====================
 
 async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -714,9 +801,24 @@ async def owner_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Пользователей: <b>{s['users']}</b>\n🏷 Сервисов: <b>{s['services']}</b>\n🛡 Админов: <b>{s['admins']}</b>\n\n"
         f"📥 Всего заявок: <b>{s['total_requests']}</b>\n⏳ В очереди: <b>{s['queued']}</b>\n"
         f"🔄 В процессе: <b>{s['in_progress']}</b>\n⏱ В холде: <b>{s['in_hold']}</b>\n"
-        f"✅ Оплачено: <b>{s['paid']}</b>\n❌ Отклонено: <b>{s['rejected']}</b>\n🚫 Слёт: <b>{s['banned_no_pay']}</b>\n\n"
+        f"✅ Оплачено: <b>{s['paid']}</b>\n❌ Отклонено: <b>{s['rejected']}</b>\n"
+        f"🚫 Слёт: <b>{s['banned_no_pay']}</b>\n⏹ Остановлено (часовые): <b>{s['stopped']}</b>\n\n"
         f"💰 Заработано всеми: <b>${s['total_earned']:.2f}</b>\n💳 На балансах сейчас: <b>${s['total_balance']:.2f}</b>"
     )
+    await q.message.edit_text(text, reply_markup=owner_menu(), parse_mode="HTML")
+
+
+async def owner_durations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_superadmin(q.from_user.id):
+        return
+    rows = held_stats(20)
+    if not rows:
+        text = "⏱ Пока нет завершённых холдов."
+    else:
+        lines = [f"📱 {r['phone']} — {r['held_minutes']} мин — {r['service_name']}" for r in rows]
+        text = "⏱ <b>Последние номера по времени холда:</b>\n\n" + "\n".join(lines)
     await q.message.edit_text(text, reply_markup=owner_menu(), parse_mode="HTML")
 
 
@@ -732,13 +834,19 @@ async def owner_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         for r in rows:
             mode_label = "мы даём" if r["mode"] == "admin_gives_code" else "нам дают"
-            text += f"#{r['id']} — {r['name']} — ${r['price']:.2f} ({mode_label}, холд {fmt_hold(r['hold_seconds'])})\n"
+            rec_label = ", почасово" if r["recurring"] else ""
+            text += f"#{r['id']} — {r['name']} ({mode_label}{rec_label})\n"
     text += (
         "\n<b>Команды:</b>\n"
-        "/add Название Цена Холд Режим\n"
-        "  Режим: us — мы даём код, them — нам дают код\n"
-        "  Холд: 10м / 1ч / 45с (для them можно 0м)\n"
-        "  Пример: /add Пятёрочка 4 10м us\n"
+        "/add Название Цена/Холд Режим\n"
+        "  Холд — число минут: 4/10\n"
+        "  Почасовая оплата: 5/каждый час\n"
+        "  Режим: us — мы даём код, them — нам дают код\n\n"
+        "  Примеры:\n"
+        "  /add Пятёрочка 4/10 us\n"
+        "  /add ВКонтакте 3/25 us\n"
+        "  /add Магнит 6/60 us\n"
+        "  /add Авито 5/каждый час us\n\n"
         "/del ID\n/list\n"
         "/clearqueue [ID] — очистить очередь\n"
         "/broadcast Текст — рассылка всем\n"
@@ -798,31 +906,76 @@ async def owner_payall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_superadmin(update.effective_user.id):
         return
-    if len(context.args) < 4:
+    if len(context.args) < 3:
         await update.message.reply_text(
-            "Использование:\n/add Название Цена Холд Режим\n\n"
-            "Режим: us — мы даём код, them — нам дают код\n"
-            "Холд: 10м / 1ч / 45с (для them можно 0м)\n\n"
-            "Пример:\n/add Пятёрочка 4 10м us\n/add Авито 3 0м them"
+            "Использование:\n/add Название Цена/Холд Режим\n\n"
+            "Холд — число минут: 4/10 значит $4 и холд 10 минут\n"
+            "Почасовая оплата: 5/каждый час — $5 будут начисляться каждый час, пока номер не остановят\n\n"
+            "Режим: us — мы даём код, them — нам дают код (последним словом в команде)\n\n"
+            "Примеры:\n"
+            "/add Пятёрочка 4/10 us\n"
+            "/add ВКонтакте 3/25 us\n"
+            "/add Магнит 6/60 us\n"
+            "/add Авито 5/каждый час us"
         )
         return
+
     mode_raw = context.args[-1].lower()
     if mode_raw not in ("us", "them"):
-        await update.message.reply_text("Режим должен быть 'us' или 'them'")
+        await update.message.reply_text("Режим должен быть 'us' или 'them' (последним словом в команде)")
         return
     mode = "admin_gives_code" if mode_raw == "us" else "user_gives_code"
+
+    rest = context.args[:-1]
+    slash_idx = None
+    for i, tok in enumerate(rest):
+        if "/" in tok:
+            slash_idx = i
+            break
+
+    if slash_idx is None or slash_idx == 0:
+        await update.message.reply_text("❌ Не найден формат Цена/Холд (например 4/10). Напишите /add без аргументов для помощи.")
+        return
+
+    name = " ".join(rest[:slash_idx])
+    price_hold_str = " ".join(rest[slash_idx:])
+    if "/" not in price_hold_str:
+        await update.message.reply_text("❌ Не найден символ '/' между ценой и холдом.")
+        return
+
+    price_part, hold_part = price_hold_str.split("/", 1)
+    hold_part = hold_part.strip().lower()
+
     try:
-        hold = parse_hold_time(context.args[-2])
-        price = parse_price(context.args[-3])
-        name = " ".join(context.args[:-3])
-        if not name:
-            raise ValueError("Не указано название")
-        sid = add_service(name, price, hold, mode)
-        await update.message.reply_text(
-            f"🟢✅ Сервис добавлен: #{sid} {name} — ${price:.2f}, холд {fmt_hold(hold)} ({mode_raw})"
-        )
+        price = parse_price(price_part)
+    except Exception:
+        await update.message.reply_text("❌ Не удалось распознать цену.")
+        return
+
+    if not name:
+        await update.message.reply_text("❌ Не указано название сервиса.")
+        return
+
+    if "час" in hold_part:
+        recurring = 1
+        hold_seconds = 3600
+        display_name = f"{name} {fmt_price(price)}$ каждый час"
+    else:
+        recurring = 0
+        if hold_part.isdigit():
+            hold_seconds = int(hold_part) * 60
+        else:
+            hold_seconds = parse_hold_time(hold_part)
+        display_name = f"{name} {fmt_price(price)}/{hold_seconds // 60}"
+
+    try:
+        sid = add_service(display_name, price, hold_seconds, mode, recurring)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    mode_label = "мы даём код" if mode == "admin_gives_code" else "нам дают код"
+    await update.message.reply_text(f"🟢✅ Сервис добавлен: #{sid} «{display_name}» ({mode_label})")
 
 
 async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -842,7 +995,11 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("Пусто")
         return
-    lines = [f"#{r['id']} — {r['name']} — ${r['price']:.2f} ({r['mode']}, холд {fmt_hold(r['hold_seconds'])})" for r in rows]
+    lines = []
+    for r in rows:
+        mode_label = "us" if r["mode"] == "admin_gives_code" else "them"
+        rec = " почасово" if r["recurring"] else ""
+        lines.append(f"#{r['id']} — {r['name']} ({mode_label}{rec})")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -947,7 +1104,7 @@ async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введите число, например /topup 10")
         return
     try:
-        invoice = await create_invoice(amount, description="Пополнение баланса приложения WillySMS 24/7")
+        invoice = await create_invoice(amount, description="Пополнение баланса приложения Willy")
     except CryptoPayError as e:
         await update.message.reply_text(f"❌ Ошибка создания счёта: {e}")
         return
